@@ -270,7 +270,13 @@ def init_database():
 
     conn.commit()
     conn.close()
-
+    # DATABASE INITIALIZATION FOR RENDER / GUNICORN
+try:
+    init_database()
+    print("[SUCCESS] Database initialized successfully.")
+except Exception as e:
+    print("[ERROR] Database initialization failed:", e)
+    raise
 # ----------------------------------------------------
 # 4. FAKE IMAGE DETECTION & AUTHENTICITY INSPECTION
 # ----------------------------------------------------
