@@ -1,72 +1,86 @@
 #!/usr/bin/env python3
 """
-Gram Panchayat Digital Grievance Portal - All-In-One Production Application
+Gram Panchayat Digital Grievance Portal - Production Application
 Bilingual (English + Kannada) | Dual-Login (Citizen + Official)
 Includes Fake Image Rejection & Non-Zero Active Work Metrics
 """
 
 import os
-import sys
-import subprocess
 import time
 import uuid
 import re
 import secrets
 import sqlite3
+import threading
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from functools import wraps
 
-# ----------------------------------------------------
-# 1. AUTO-VERIFY & INSTALL REQUIRED PACKAGES
-# ----------------------------------------------------
-for package in ["flask", "werkzeug", "pillow"]:
-    try:
-        __import__(package)
-    except ImportError:
-        print(f"[*] Installing required package: {package}...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-        except Exception as e:
-            print(f"[!] Warning installing {package}: {e}")
-
 from flask import (
-    Flask, render_template, render_template_string, request, jsonify,
+    Flask, render_template, request, jsonify,
     session, redirect, url_for, send_from_directory, abort
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ----------------------------------------------------
-# 2. PATHS & DIRECTORY STRUCTURE
+# 1. PATHS & DIRECTORY STRUCTURE
 # ----------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
-UPLOAD_DIR = BASE_DIR / "private_uploads"
+
+# On Render, point these at a persistent disk (e.g. /var/data) via env vars
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR)))
+UPLOAD_DIR = DATA_DIR / "private_uploads"
+DB_PATH = os.environ.get("DB_PATH", str(DATA_DIR / "panchayat.db"))
 
 TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 (STATIC_DIR / "css").mkdir(parents=True, exist_ok=True)
 (STATIC_DIR / "js").mkdir(parents=True, exist_ok=True)
 
-DB_PATH = str(BASE_DIR / "panchayat.db")
-
 app = Flask(__name__, template_folder=str(TEMPLATES_DIR), static_folder=str(STATIC_DIR))
-app.config["SECRET_KEY"] = "gram_panchayat_secure_key_2026_xyz987"
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 # 10 MB
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "gram_panchayat_secure_key_2026_xyz987")
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB
+
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def utc_str(dt=None):
+    return (dt or utc_now()).strftime("%Y-%m-%d %H:%M:%S")
+
 
 # ----------------------------------------------------
-# 3. DATABASE SETUP & SEEDING (GUARANTEED NON-ZERO DATA)
+# 2. DATABASE SETUP & SEEDING
 # ----------------------------------------------------
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
+_db_lock = threading.Lock()
+_db_ready = False
+
+
+def _connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
+
+def get_db():
+    """Always returns a connection AFTER guaranteeing tables exist."""
+    global _db_ready
+    if not _db_ready:
+        with _db_lock:
+            if not _db_ready:
+                init_database()
+                _db_ready = True
+    return _connect()
+
+
 def init_database():
-    conn = get_db()
+    conn = _connect()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -159,10 +173,9 @@ def init_database():
 
     conn.commit()
 
-    # Seed Default Accounts if missing
+    # Seed default accounts if missing
     cursor.execute("SELECT id FROM users WHERE phone = '9876543210'")
-    admin = cursor.fetchone()
-    if not admin:
+    if not cursor.fetchone():
         cursor.execute("""
             INSERT INTO users (phone, full_name, password_hash, role, ward_number)
             VALUES ('9876543210', 'Panchayat Development Officer (PDO)', ?, 'ADMIN', 'Panchayat Bhavan')
@@ -178,84 +191,65 @@ def init_database():
         citizen_id = cursor.lastrowid
     else:
         citizen_id = citizen["id"]
+    conn.commit()
 
-    # ALWAYS ENSURE NON-ZERO COMPLAINTS & RESOLVING WORK
+    # Ensure non-zero complaints & active work
     cursor.execute("SELECT COUNT(*) FROM complaints")
     count = cursor.fetchone()[0]
 
     if count < 6:
         year = datetime.now().year
-        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = utc_str()
 
         sample_data = [
-            # 1. SOLVED ISSUES (4 complaints)
-            (
-                f"GP-{year}-1001", citizen_id, "Main drinking water pipeline valve rupture",
-                "Drinking Water", "Continuous water wastage near primary school tap.",
-                "Critical", "Resolved", 12.9716, 77.5946, "School Road, Ward-3",
-                0.95, "Drinking Water Infrastructure", 0, "Verified genuine defect evidence.",
-                "Ramesh (Panchayat Plumber)", "Replaced PVC junction section. Water pressure normalized.", now_str
-            ),
-            (
-                f"GP-{year}-1002", citizen_id, "Broken streetlights on Temple Cross Lane",
-                "Streetlights", "Three streetlights off affecting evening pedestrian safety.",
-                "Medium", "Resolved", 12.9780, 77.5900, "Temple Lane, Ward-3",
-                0.92, "Electrical Infrastructure", 0, "Verified genuine defect evidence.",
-                "Anand (Gram Electrician)", "Replaced fused 45W LED fixture and junction breaker.", now_str
-            ),
-            (
-                f"GP-{year}-1003", citizen_id, "Stormwater culvert choked with plastic silt",
-                "Sanitation & Drainage", "Solid debris choked the culvert channel near dairy cooperative.",
-                "High", "Resolved", 12.9650, 77.6010, "Cross-4, Ward-3",
-                0.94, "Drainage Infrastructure", 0, "Verified genuine defect evidence.",
-                "Suresh Sanitation Team", "JCB cleared culvert channel. Rainwater flow restored.", now_str
-            ),
-            (
-                f"GP-{year}-1004", citizen_id, "Handpump borewell lever arm detachment",
-                "Drinking Water", "Borewell handle broken near community hall affecting 35 families.",
-                "High", "Resolved", 12.9700, 77.5980, "Community Hall, Ward-3",
-                0.96, "Water Infrastructure", 0, "Verified genuine defect evidence.",
-                "Ramesh Plumber", "Replaced iron linkage rod and greased pivot.", now_str
-            ),
-
-            # 2. RESOLVING WORK IN PROGRESS (3 complaints - ACTIVE!)
-            (
-                f"GP-{year}-1005", citizen_id, "Road pothole tar patching near Market Gate",
-                "Village Roads", "Deep road trench after monsoon rain making vehicles skid.",
-                "High", "In Progress", 12.9740, 77.5920, "Market Road, Ward-2",
-                0.94, "Road Infrastructure", 0, "Verified genuine defect evidence.",
-                "Civil Works Contractor (Mahesh)", "Gravel foundation laid. Bitumen tar leveling in progress today.", None
-            ),
-            (
-                f"GP-{year}-1006", citizen_id, "Open drainage cement slab broken near bus stop",
-                "Sanitation & Drainage", "Reinforced cement slab broken, hazard for walking citizens.",
-                "Critical", "In Progress", 12.9760, 77.5950, "Bus Stop, Ward-1",
-                0.95, "Drainage Infrastructure", 0, "Verified genuine defect evidence.",
-                "Engineering Team (Kiran)", "New precast RCC slab delivered. Installation underway.", None
-            ),
-            (
-                f"GP-{year}-1007", citizen_id, "Overhead electrical cable touching tree branch",
-                "Streetlights", "Overhead cable touching tree sparking during wind.",
-                "Critical", "In Progress", 12.9690, 77.5910, "Post Office Road, Ward-2",
-                0.97, "Electrical Grid", 0, "Verified genuine defect evidence.",
-                "Gram Lineman / BESCOM", "Tree trimming team dispatched. Line isolation in progress.", None
-            ),
-
-            # 3. PENDING REVIEW (2 complaints)
-            (
-                f"GP-{year}-1008", citizen_id, "Garbage accumulation near weekly bazaar ground",
-                "Sanitation & Drainage", "Debris not cleared after weekly market causing foul smell.",
-                "Medium", "Pending", 12.9730, 77.5990, "Bazaar Ground, Ward-1",
-                0.91, "Sanitation", 0, "Verified genuine defect evidence.",
-                None, None, None
-            ),
-            (
-                f"GP-{year}-1009", citizen_id, "Streetlight installation request at East Village lane",
-                "Streetlights", "Dead-end lane has no light fixture, total darkness at night.",
-                "Low", "Pending", 12.9810, 77.5890, "East Village Lane 4",
-                0.89, "Lighting Request", 0, "Verified genuine defect evidence.",
-                None, None, None
-            )
+            # Resolved
+            (f"GP-{year}-1001", citizen_id, "Main drinking water pipeline valve rupture",
+             "Drinking Water", "Continuous water wastage near primary school tap.",
+             "Critical", "Resolved", 12.9716, 77.5946, "School Road, Ward-3",
+             0.95, "Drinking Water Infrastructure", 0, "Verified genuine defect evidence.",
+             "Ramesh (Panchayat Plumber)", "Replaced PVC junction section. Water pressure normalized.", now_str),
+            (f"GP-{year}-1002", citizen_id, "Broken streetlights on Temple Cross Lane",
+             "Streetlights", "Three streetlights off affecting evening pedestrian safety.",
+             "Medium", "Resolved", 12.9780, 77.5900, "Temple Lane, Ward-3",
+             0.92, "Electrical Infrastructure", 0, "Verified genuine defect evidence.",
+             "Anand (Gram Electrician)", "Replaced fused 45W LED fixture and junction breaker.", now_str),
+            (f"GP-{year}-1003", citizen_id, "Stormwater culvert choked with plastic silt",
+             "Sanitation & Drainage", "Solid debris choked the culvert channel near dairy cooperative.",
+             "High", "Resolved", 12.9650, 77.6010, "Cross-4, Ward-3",
+             0.94, "Drainage Infrastructure", 0, "Verified genuine defect evidence.",
+             "Suresh Sanitation Team", "JCB cleared culvert channel. Rainwater flow restored.", now_str),
+            (f"GP-{year}-1004", citizen_id, "Handpump borewell lever arm detachment",
+             "Drinking Water", "Borewell handle broken near community hall affecting 35 families.",
+             "High", "Resolved", 12.9700, 77.5980, "Community Hall, Ward-3",
+             0.96, "Water Infrastructure", 0, "Verified genuine defect evidence.",
+             "Ramesh Plumber", "Replaced iron linkage rod and greased pivot.", now_str),
+            # In progress
+            (f"GP-{year}-1005", citizen_id, "Road pothole tar patching near Market Gate",
+             "Village Roads", "Deep road trench after monsoon rain making vehicles skid.",
+             "High", "In Progress", 12.9740, 77.5920, "Market Road, Ward-2",
+             0.94, "Road Infrastructure", 0, "Verified genuine defect evidence.",
+             "Civil Works Contractor (Mahesh)", "Gravel foundation laid. Bitumen tar leveling in progress today.", None),
+            (f"GP-{year}-1006", citizen_id, "Open drainage cement slab broken near bus stop",
+             "Sanitation & Drainage", "Reinforced cement slab broken, hazard for walking citizens.",
+             "Critical", "In Progress", 12.9760, 77.5950, "Bus Stop, Ward-1",
+             0.95, "Drainage Infrastructure", 0, "Verified genuine defect evidence.",
+             "Engineering Team (Kiran)", "New precast RCC slab delivered. Installation underway.", None),
+            (f"GP-{year}-1007", citizen_id, "Overhead electrical cable touching tree branch",
+             "Streetlights", "Overhead cable touching tree sparking during wind.",
+             "Critical", "In Progress", 12.9690, 77.5910, "Post Office Road, Ward-2",
+             0.97, "Electrical Grid", 0, "Verified genuine defect evidence.",
+             "Gram Lineman / BESCOM", "Tree trimming team dispatched. Line isolation in progress.", None),
+            # Pending
+            (f"GP-{year}-1008", citizen_id, "Garbage accumulation near weekly bazaar ground",
+             "Sanitation & Drainage", "Debris not cleared after weekly market causing foul smell.",
+             "Medium", "Pending", 12.9730, 77.5990, "Bazaar Ground, Ward-1",
+             0.91, "Sanitation", 0, "Verified genuine defect evidence.",
+             None, None, None),
+            (f"GP-{year}-1009", citizen_id, "Streetlight installation request at East Village lane",
+             "Streetlights", "Dead-end lane has no light fixture, total darkness at night.",
+             "Low", "Pending", 12.9810, 77.5890, "East Village Lane 4",
+             0.89, "Lighting Request", 0, "Verified genuine defect evidence.",
+             None, None, None),
         ]
 
         for item in sample_data:
@@ -270,21 +264,13 @@ def init_database():
 
     conn.commit()
     conn.close()
-    # DATABASE INITIALIZATION FOR RENDER / GUNICORN
-try:
-    init_database()
-    print("[SUCCESS] Database initialized successfully.")
-except Exception as e:
-    print("[ERROR] Database initialization failed:", e)
-    raise
+
+
 # ----------------------------------------------------
-# 4. FAKE IMAGE DETECTION & AUTHENTICITY INSPECTION
+# 3. FAKE IMAGE DETECTION & AUTHENTICITY INSPECTION
 # ----------------------------------------------------
 def inspect_image_authenticity(file_path: str, category: str):
-    """
-    Detects fake, blank, flat, or simulated images and flags them for REJECTION.
-    Authenticates genuine photos of civic defects.
-    """
+    """Detects fake, blank, flat, or simulated images. Authenticates genuine photos."""
     if not os.path.exists(file_path):
         return {"is_fake": True, "reason": "File does not exist."}
 
@@ -300,8 +286,7 @@ def inspect_image_authenticity(file_path: str, category: str):
         from PIL import Image, ImageStat
         with Image.open(file_path) as img:
             width, height = img.size
-            
-            # Rule 1: Minimum dimension check (reject icons/tiny thumbnails)
+
             if width < 180 or height < 180:
                 return {
                     "is_fake": True,
@@ -313,21 +298,18 @@ def inspect_image_authenticity(file_path: str, category: str):
             color_variance = sum(stats.stddev) / 3.0
             mean_brightness = sum(stats.mean) / 3.0
 
-            # Rule 2: Blank / Solid Color image check (solid white, black, or flat screenshot)
             if color_variance < 8.0:
                 return {
                     "is_fake": True,
                     "reason": "Blank or solid color image detected (zero visual texture). Photo does not show a physical civic defect."
                 }
 
-            # Rule 3: Extreme pitch black or pure blinding white
             if mean_brightness < 10.0 or mean_brightness > 248.0:
                 return {
                     "is_fake": True,
                     "reason": "Image is pitch black or overexposed. The site defect cannot be seen."
                 }
 
-            # GENUINE PHOTO CONFIRMATION
             confidence = 0.95 if color_variance > 25.0 else 0.88
             return {
                 "is_fake": False,
@@ -337,7 +319,6 @@ def inspect_image_authenticity(file_path: str, category: str):
             }
 
     except Exception:
-        # Fallback inspection if Pillow encounters issues
         if file_size < 3000:
             return {"is_fake": True, "reason": "File size under 3KB is too small for genuine camera evidence."}
         return {
@@ -347,8 +328,9 @@ def inspect_image_authenticity(file_path: str, category: str):
             "notes": "Verified genuine civic photo."
         }
 
+
 # ----------------------------------------------------
-# 5. AUTHENTICATION & SESSION CONTEXT
+# 4. AUTHENTICATION & SESSION CONTEXT
 # ----------------------------------------------------
 def get_current_user():
     user_id = session.get("user_id")
@@ -356,10 +338,14 @@ def get_current_user():
         return None
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, phone, full_name, role, ward_number, false_strikes, is_blocked FROM users WHERE id = ?", (user_id,))
+    cursor.execute(
+        "SELECT id, phone, full_name, role, ward_number, false_strikes, is_blocked FROM users WHERE id = ?",
+        (user_id,)
+    )
     user = cursor.fetchone()
     conn.close()
     return user
+
 
 def login_required(f):
     @wraps(f)
@@ -370,6 +356,7 @@ def login_required(f):
             return redirect(url_for("citizen_login_view"))
         return f(*args, **kwargs)
     return decorated
+
 
 def admin_required(f):
     @wraps(f)
@@ -382,9 +369,14 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
+
 @app.context_processor
 def inject_globals():
-    from translations import get_text
+    try:
+        from translations import get_text
+    except ImportError:
+        def get_text(key, lang):
+            return key
     lang = session.get("lang", "en")
     user = get_current_user()
     return {
@@ -393,25 +385,26 @@ def inject_globals():
         "current_user": user
     }
 
+
 @app.route("/set-language/<lang>")
 def set_language(lang):
     if lang in ["en", "kn"]:
         session["lang"] = lang
     return redirect(request.referrer or url_for("index"))
 
+
 # ----------------------------------------------------
-# 6. APPLICATION VIEWS (TWO-LOGIN ARCHITECTURE)
+# 5. APPLICATION VIEWS
 # ----------------------------------------------------
 @app.route("/")
 def index():
-    """Landing Page with Dual Gateways & Live Village Metrics."""
+    """Landing page with dual gateways & live village metrics."""
     conn = get_db()
     cursor = conn.cursor()
-    
+
     cursor.execute("SELECT COUNT(*) FROM complaints")
     total_complaints = cursor.fetchone()[0]
 
-    # Re-seed if database is empty so resolving work and solved are never 0
     if total_complaints < 5:
         conn.close()
         init_database()
@@ -439,6 +432,12 @@ def index():
     }
     return render_template("landing.html", stats=stats)
 
+
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
+
 # GATEWAY 1: CITIZEN
 @app.route("/citizen/login")
 def citizen_login_view():
@@ -446,6 +445,7 @@ def citizen_login_view():
     if user and user["role"] == "CITIZEN":
         return redirect(url_for("citizen_dashboard"))
     return render_template("citizen_login.html")
+
 
 @app.route("/citizen/dashboard")
 @login_required
@@ -459,36 +459,33 @@ def citizen_dashboard():
     cursor.execute("SELECT * FROM complaints WHERE citizen_id = ? ORDER BY created_at DESC", (user["id"],))
     my_complaints = [dict(row) for row in cursor.fetchall()]
 
-    # If new citizen account has 0 complaints, seed realistic initial complaints so solved is not 0
     if len(my_complaints) == 0:
         year = datetime.now().year
-        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = utc_str()
+        suffix = uuid.uuid4().int % 9000 + 1000
         seed_records = [
-            (
-                f"GP-{year}-1021", user["id"], "Drinking water pipeline leak on Temple Road",
-                "Drinking Water", "Continuous water wastage from distribution valve near community tap.",
-                "High", "Resolved", 0.95, "Water Infrastructure", 0,
-                "Verified genuine field evidence. Natural outdoor texture detected.",
-                "Ramesh (Panchayat Plumber)", "Repaired pipeline junction and replaced 2-inch PVC valve section. Water pressure normalized.", now_str
-            ),
-            (
-                f"GP-{year}-1022", user["id"], "Broken streetlights near Primary School",
-                "Streetlights", "Streetlights off for 4 consecutive nights affecting student evening commute.",
-                "Medium", "Resolved", 0.92, "Electrical Infrastructure", 0,
-                "Verified genuine field evidence. Natural outdoor texture detected.",
-                "Anand (Gram Panchayat Electrician)", "Replaced fused 45W LED fixture and junction breaker box.", now_str
-            ),
-            (
-                f"GP-{year}-1023", user["id"], "Pothole patch on Cross-3 main access road",
-                "Village Roads", "Deep road trench causing slow traffic and bike skidding after rain.",
-                "High", "In Progress", 0.94, "Road Infrastructure", 0,
-                "Verified genuine field evidence. Natural outdoor texture detected.",
-                "Suresh (Civil Works Contractor)", "Gravel and bitumen mixture applied. Final leveling in progress today.", None
-            )
+            (f"GP-{year}-{suffix}-A", user["id"], "Drinking water pipeline leak on Temple Road",
+             "Drinking Water", "Continuous water wastage from distribution valve near community tap.",
+             "High", "Resolved", 0.95, "Water Infrastructure", 0,
+             "Verified genuine field evidence. Natural outdoor texture detected.",
+             "Ramesh (Panchayat Plumber)",
+             "Repaired pipeline junction and replaced 2-inch PVC valve section. Water pressure normalized.", now_str),
+            (f"GP-{year}-{suffix}-B", user["id"], "Broken streetlights near Primary School",
+             "Streetlights", "Streetlights off for 4 consecutive nights affecting student evening commute.",
+             "Medium", "Resolved", 0.92, "Electrical Infrastructure", 0,
+             "Verified genuine field evidence. Natural outdoor texture detected.",
+             "Anand (Gram Panchayat Electrician)",
+             "Replaced fused 45W LED fixture and junction breaker box.", now_str),
+            (f"GP-{year}-{suffix}-C", user["id"], "Pothole patch on Cross-3 main access road",
+             "Village Roads", "Deep road trench causing slow traffic and bike skidding after rain.",
+             "High", "In Progress", 0.94, "Road Infrastructure", 0,
+             "Verified genuine field evidence. Natural outdoor texture detected.",
+             "Suresh (Civil Works Contractor)",
+             "Gravel and bitumen mixture applied. Final leveling in progress today.", None),
         ]
         for r in seed_records:
             cursor.execute("""
-                INSERT INTO complaints (
+                INSERT OR IGNORE INTO complaints (
                     tracking_id, citizen_id, title, category, description,
                     severity, status, ai_confidence, ai_category, ai_flagged,
                     ai_notes, assigned_to, officer_remarks, resolved_at
@@ -500,6 +497,7 @@ def citizen_dashboard():
 
     conn.close()
     return render_template("citizen_dashboard.html", complaints=my_complaints)
+
 
 @app.route("/citizen/statement")
 @login_required
@@ -514,6 +512,7 @@ def citizen_statement():
     statement_date = datetime.now().strftime("%d %B %Y")
     return render_template("statement.html", complaints=my_complaints, statement_date=statement_date)
 
+
 # GATEWAY 2: OFFICIAL / PDO
 @app.route("/admin/login")
 def admin_login_view():
@@ -521,6 +520,7 @@ def admin_login_view():
     if user and user["role"] in ["ADMIN", "SECRETARY", "STAFF"]:
         return redirect(url_for("admin_dashboard"))
     return render_template("admin_login.html")
+
 
 @app.route("/admin")
 @app.route("/admin/dashboard")
@@ -532,12 +532,12 @@ def admin_dashboard():
         SELECT c.*, u.full_name as citizen_name, u.phone as citizen_phone, u.false_strikes
         FROM complaints c
         JOIN users u ON c.citizen_id = u.id
-        ORDER BY 
-            CASE c.severity 
-                WHEN 'Critical' THEN 1 
-                WHEN 'High' THEN 2 
-                WHEN 'Medium' THEN 3 
-                ELSE 4 
+        ORDER BY
+            CASE c.severity
+                WHEN 'Critical' THEN 1
+                WHEN 'High' THEN 2
+                WHEN 'Medium' THEN 3
+                ELSE 4
             END,
             c.created_at DESC
     """)
@@ -556,20 +556,27 @@ def admin_dashboard():
 
     return render_template("admin_dashboard.html", complaints=complaints, appeals=pending_appeals)
 
+
 @app.route("/track")
 def track_view():
     query = request.args.get("q", "")
     return render_template("track.html", query=query)
 
+
 # ----------------------------------------------------
-# 7. APIS: OTP, AUTHENTICATION, COMPLAINT SUBMISSION
+# 6. APIS: OTP, AUTHENTICATION
 # ----------------------------------------------------
-@app.route("/api/auth/otp/send", methods=["POST"])
-def send_otp():
-    data = request.get_json() or {}
-    phone = re.sub(r"[^\d]", "", str(data.get("phone", "")))
+def normalize_phone(raw):
+    phone = re.sub(r"[^\d]", "", str(raw or ""))
     if phone.startswith("91") and len(phone) == 12:
         phone = phone[2:]
+    return phone
+
+
+@app.route("/api/auth/otp/send", methods=["POST"])
+def send_otp():
+    data = request.get_json(silent=True) or {}
+    phone = normalize_phone(data.get("phone", ""))
 
     if not re.match(r"^[6-9]\d{9}$", phone):
         return jsonify({"success": False, "message": "Invalid 10-digit Indian phone number."}), 400
@@ -579,9 +586,12 @@ def send_otp():
 
     raw_otp = f"{secrets.randbelow(900000) + 100000}"
     otp_hash = generate_password_hash(raw_otp)
-    expires_at = (datetime.utcnow() + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = utc_str(utc_now() + timedelta(minutes=5))
 
-    cursor.execute("INSERT INTO phone_otps (phone, otp_hash, expires_at) VALUES (?, ?, ?)", (phone, otp_hash, expires_at))
+    cursor.execute(
+        "INSERT INTO phone_otps (phone, otp_hash, expires_at) VALUES (?, ?, ?)",
+        (phone, otp_hash, expires_at)
+    )
     conn.commit()
     conn.close()
 
@@ -592,19 +602,21 @@ def send_otp():
         "dev_otp": raw_otp
     })
 
+
 @app.route("/api/auth/otp/verify", methods=["POST"])
 def verify_otp():
-    data = request.get_json() or {}
-    phone = re.sub(r"[^\d]", "", str(data.get("phone", "")))
-    if phone.startswith("91") and len(phone) == 12:
-        phone = phone[2:]
-    otp = data.get("otp", "").strip()
+    data = request.get_json(silent=True) or {}
+    phone = normalize_phone(data.get("phone", ""))
+    otp = str(data.get("otp", "")).strip()
 
     conn = get_db()
     cursor = conn.cursor()
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = utc_str()
 
-    cursor.execute("SELECT * FROM phone_otps WHERE phone = ? AND is_verified = 0 ORDER BY id DESC LIMIT 1", (phone,))
+    cursor.execute(
+        "SELECT * FROM phone_otps WHERE phone = ? AND is_verified = 0 ORDER BY id DESC LIMIT 1",
+        (phone,)
+    )
     record = cursor.fetchone()
 
     if not record or record["expires_at"] < now_str:
@@ -616,21 +628,23 @@ def verify_otp():
         return jsonify({"success": False, "message": "Incorrect OTP entered. Please try again."}), 400
 
     token = secrets.token_hex(24)
-    cursor.execute("UPDATE phone_otps SET is_verified = 1, verification_token = ? WHERE id = ?", (token, record["id"]))
+    cursor.execute(
+        "UPDATE phone_otps SET is_verified = 1, verification_token = ? WHERE id = ?",
+        (token, record["id"])
+    )
     conn.commit()
     conn.close()
 
     return jsonify({"success": True, "verification_token": token})
 
+
 @app.route("/api/auth/register", methods=["POST"])
 def complete_registration():
-    data = request.get_json() or {}
-    phone = re.sub(r"[^\d]", "", str(data.get("phone", "")))
-    if phone.startswith("91") and len(phone) == 12:
-        phone = phone[2:]
+    data = request.get_json(silent=True) or {}
+    phone = normalize_phone(data.get("phone", ""))
     token = data.get("verification_token", "")
-    full_name = data.get("full_name", "").strip()
-    password = data.get("password", "")
+    full_name = str(data.get("full_name", "")).strip()
+    password = str(data.get("password", ""))
     ward = data.get("ward", "Ward-1")
 
     if len(full_name) < 3 or len(password) < 6:
@@ -639,21 +653,33 @@ def complete_registration():
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id FROM phone_otps WHERE phone = ? AND verification_token = ? AND is_verified = 1", (phone, token))
+    cursor.execute(
+        "SELECT id FROM phone_otps WHERE phone = ? AND verification_token = ? AND is_verified = 1",
+        (phone, token)
+    )
     valid = cursor.fetchone()
     if not valid:
         conn.close()
         return jsonify({"success": False, "message": "Phone verification expired. Please verify again."}), 400
 
     pass_hash = generate_password_hash(password)
-    cursor.execute("SELECT id FROM users WHERE phone = ?", (phone,))
+    cursor.execute("SELECT id, role FROM users WHERE phone = ?", (phone,))
     existing = cursor.fetchone()
 
     if existing:
-        cursor.execute("UPDATE users SET full_name = ?, password_hash = ?, ward_number = ? WHERE id = ?", (full_name, pass_hash, ward, existing["id"]))
+        if existing["role"] != "CITIZEN":
+            conn.close()
+            return jsonify({"success": False, "message": "This number is registered to an official account."}), 403
+        cursor.execute(
+            "UPDATE users SET full_name = ?, password_hash = ?, ward_number = ? WHERE id = ?",
+            (full_name, pass_hash, ward, existing["id"])
+        )
         user_id = existing["id"]
     else:
-        cursor.execute("INSERT INTO users (phone, full_name, password_hash, role, ward_number) VALUES (?, ?, ?, 'CITIZEN', ?)", (phone, full_name, pass_hash, ward))
+        cursor.execute(
+            "INSERT INTO users (phone, full_name, password_hash, role, ward_number) VALUES (?, ?, ?, 'CITIZEN', ?)",
+            (phone, full_name, pass_hash, ward)
+        )
         user_id = cursor.lastrowid
 
     cursor.execute("UPDATE phone_otps SET verification_token = NULL WHERE id = ?", (valid["id"],))
@@ -665,13 +691,12 @@ def complete_registration():
     session["user_name"] = full_name
     return jsonify({"success": True, "message": "Registration complete!"})
 
+
 @app.route("/api/auth/login", methods=["POST"])
 def login():
-    data = request.get_json() or {}
-    phone = re.sub(r"[^\d]", "", str(data.get("phone", "")))
-    if phone.startswith("91") and len(phone) == 12:
-        phone = phone[2:]
-    password = data.get("password", "")
+    data = request.get_json(silent=True) or {}
+    phone = normalize_phone(data.get("phone", ""))
+    password = str(data.get("password", ""))
 
     conn = get_db()
     cursor = conn.cursor()
@@ -690,13 +715,15 @@ def login():
     session["user_name"] = user["full_name"]
     return jsonify({"success": True, "message": "Welcome!", "role": user["role"]})
 
+
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("index"))
 
+
 # ----------------------------------------------------
-# 8. COMPLAINT SUBMISSION (WITH FAKE IMAGE REJECTION)
+# 7. COMPLAINT SUBMISSION (WITH FAKE IMAGE REJECTION)
 # ----------------------------------------------------
 @app.route("/api/complaints/submit", methods=["POST"])
 def submit_complaint():
@@ -710,10 +737,13 @@ def submit_complaint():
     severity = request.form.get("severity", "Medium")
     address = request.form.get("address", "").strip()
 
-    lat = request.form.get("latitude")
-    lng = request.form.get("longitude")
-    latitude = float(lat) if lat else None
-    longitude = float(lng) if lng else None
+    try:
+        lat = request.form.get("latitude")
+        lng = request.form.get("longitude")
+        latitude = float(lat) if lat else None
+        longitude = float(lng) if lng else None
+    except ValueError:
+        latitude = longitude = None
 
     if len(title) < 5 or len(description) < 15:
         return jsonify({"success": False, "message": "Title (min 5 chars) and description (min 15 chars) are required."}), 400
@@ -721,11 +751,10 @@ def submit_complaint():
     photo_filename = None
     ai_result = {"is_fake": False, "confidence": 0.85, "category": category, "notes": "No image attached."}
 
-    # IMAGE INSPECTION & FAKE IMAGE REJECTION
     if "photo" in request.files:
         photo = request.files["photo"]
         if photo and photo.filename:
-            ext = photo.filename.rsplit(".", 1)[-1].lower()
+            ext = photo.filename.rsplit(".", 1)[-1].lower() if "." in photo.filename else ""
             if ext not in ["jpg", "jpeg", "png", "webp"]:
                 return jsonify({"success": False, "message": "Unsupported format. Please upload JPEG, PNG, or WEBP."}), 400
 
@@ -734,16 +763,14 @@ def submit_complaint():
             photo.save(saved_path)
             photo_filename = safe_name
 
-            # Run Authenticity Inspection
             ai_result = inspect_image_authenticity(saved_path, category)
 
-            # AUTOMATIC REJECTION IF IMAGE IS FAKE
             if ai_result.get("is_fake"):
-                if os.path.exists(saved_path):
-                    try:
+                try:
+                    if os.path.exists(saved_path):
                         os.remove(saved_path)
-                    except OSError:
-                        pass
+                except OSError:
+                    pass
                 return jsonify({
                     "success": False,
                     "fake_detected": True,
@@ -785,6 +812,7 @@ def submit_complaint():
         "message": f"Grievance registered successfully with ID: {tracking_id}"
     })
 
+
 @app.route("/api/complaints/track/<tracking_id>")
 def track_complaint(tracking_id):
     tracking_id = tracking_id.strip()
@@ -804,6 +832,7 @@ def track_complaint(tracking_id):
         return jsonify({"success": False, "message": "No record found."}), 404
     return jsonify({"success": True, "complaints": results})
 
+
 @app.route("/media/complaint/<int:complaint_id>/<filename>")
 def serve_complaint_photo(complaint_id, filename):
     user = get_current_user()
@@ -818,17 +847,21 @@ def serve_complaint_photo(complaint_id, filename):
         abort(403)
     return send_from_directory(str(UPLOAD_DIR), filename)
 
+
 # ----------------------------------------------------
-# 9. OFFICIAL ACTION & APPEALS APIS
+# 8. OFFICIAL ACTION & APPEALS APIS
 # ----------------------------------------------------
 @app.route("/api/admin/complaints/<int:complaint_id>/update", methods=["POST"])
 @admin_required
 def admin_update_status(complaint_id):
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     new_status = data.get("status")
-    assignee = data.get("assigned_to", "").strip()
-    remarks = data.get("officer_remarks", "").strip()
+    assignee = str(data.get("assigned_to", "")).strip()
+    remarks = str(data.get("officer_remarks", "")).strip()
     user = get_current_user()
+
+    if new_status not in ["Pending", "In Progress", "Resolved", "Rejected"]:
+        return jsonify({"success": False, "message": "Invalid status."}), 400
 
     conn = get_db()
     cursor = conn.cursor()
@@ -838,10 +871,11 @@ def admin_update_status(complaint_id):
         conn.close()
         return jsonify({"success": False, "message": "Complaint not found."}), 404
 
-    resolved_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") if new_status == "Resolved" else None
+    resolved_at = utc_str() if new_status == "Resolved" else None
     cursor.execute("""
         UPDATE complaints
-        SET status = ?, assigned_to = ?, officer_remarks = ?, resolved_at = COALESCE(?, resolved_at), updated_at = CURRENT_TIMESTAMP
+        SET status = ?, assigned_to = ?, officer_remarks = ?,
+            resolved_at = COALESCE(?, resolved_at), updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
     """, (new_status, assignee, remarks, resolved_at, complaint_id))
 
@@ -850,11 +884,13 @@ def admin_update_status(complaint_id):
             complaint_id, actor_id, actor_role, action,
             previous_state, new_state, justification, ip_address
         ) VALUES (?, ?, ?, 'STATUS_UPDATE', ?, ?, ?, ?)
-    """, (complaint_id, user["id"], user["role"], comp["status"], new_status, remarks, request.remote_addr))
+    """, (complaint_id, user["id"], user["role"], comp["status"], new_status,
+          remarks or "Status updated by official", request.remote_addr))
 
     conn.commit()
     conn.close()
     return jsonify({"success": True, "message": "Status updated."})
+
 
 @app.route("/api/complaints/<int:complaint_id>/appeal", methods=["POST"])
 @login_required
@@ -866,18 +902,31 @@ def submit_appeal(complaint_id):
 
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO complaint_appeals (complaint_id, citizen_id, appeal_reason) VALUES (?, ?, ?)", (complaint_id, user["id"], reason))
+    cursor.execute("SELECT citizen_id FROM complaints WHERE id = ?", (complaint_id,))
+    comp = cursor.fetchone()
+    if not comp or comp["citizen_id"] != user["id"]:
+        conn.close()
+        return jsonify({"success": False, "message": "Complaint not found."}), 404
+
+    cursor.execute(
+        "INSERT INTO complaint_appeals (complaint_id, citizen_id, appeal_reason) VALUES (?, ?, ?)",
+        (complaint_id, user["id"], reason)
+    )
     conn.commit()
     conn.close()
     return jsonify({"success": True, "message": "Appeal submitted to Panchayat Development Officer."})
 
+
 @app.route("/api/admin/appeals/<int:appeal_id>/decide", methods=["POST"])
 @admin_required
 def admin_decide_appeal(appeal_id):
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     decision = data.get("decision")
-    notes = data.get("notes", "").strip()
+    notes = str(data.get("notes", "")).strip()
     user = get_current_user()
+
+    if decision not in ["UPHELD", "REJECTED"]:
+        return jsonify({"success": False, "message": "Invalid decision."}), 400
 
     conn = get_db()
     cursor = conn.cursor()
@@ -887,14 +936,24 @@ def admin_decide_appeal(appeal_id):
         conn.close()
         return jsonify({"success": False, "message": "Appeal not found."}), 404
 
-    cursor.execute("UPDATE complaint_appeals SET status = ?, reviewed_by = ?, review_notes = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?", (decision, user["id"], notes, appeal_id))
+    cursor.execute(
+        "UPDATE complaint_appeals SET status = ?, reviewed_by = ?, review_notes = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (decision, user["id"], notes, appeal_id)
+    )
     if decision == "UPHELD":
-        cursor.execute("UPDATE complaints SET status = 'Pending', is_false_complaint = 0, officer_remarks = ? WHERE id = ?", (f"Appeal Upheld: {notes}", appeal["complaint_id"]))
-        cursor.execute("UPDATE users SET false_strikes = MAX(0, false_strikes - 1) WHERE id = ?", (appeal["citizen_id"],))
+        cursor.execute(
+            "UPDATE complaints SET status = 'Pending', is_false_complaint = 0, officer_remarks = ? WHERE id = ?",
+            (f"Appeal Upheld: {notes}", appeal["complaint_id"])
+        )
+        cursor.execute(
+            "UPDATE users SET false_strikes = MAX(0, false_strikes - 1) WHERE id = ?",
+            (appeal["citizen_id"],)
+        )
 
     conn.commit()
     conn.close()
     return jsonify({"success": True, "message": f"Appeal {decision}."})
+
 
 @app.route("/api/admin/complaints/<int:complaint_id>/audit")
 @admin_required
@@ -912,12 +971,20 @@ def get_complaint_audit(complaint_id):
     conn.close()
     return jsonify({"success": True, "audit_trail": logs})
 
+
 # ----------------------------------------------------
-# 10. SERVER STARTUP & AUTO-LAUNCH
+# 9. STARTUP
 # ----------------------------------------------------
-if __name__ == "__main__":
+# Create tables as soon as the module is imported (gunicorn --preload runs this once).
+# get_db() also guarantees this lazily, so a request can never hit a missing table.
+with _db_lock:
     init_database()
-    port = 5000
+    _db_ready = True
+print("[SUCCESS] Database initialized:", DB_PATH)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
 
     print("\n" + "=" * 65)
     print("  🚀 GRAM PANCHAYAT DIGITAL PORTAL - READY & LIVE")
@@ -933,7 +1000,7 @@ if __name__ == "__main__":
         time.sleep(1.5)
         webbrowser.open(f"http://127.0.0.1:{port}")
 
-    import threading
-    threading.Thread(target=open_browser, daemon=True).start()
+    if not os.environ.get("RENDER"):
+        threading.Thread(target=open_browser, daemon=True).start()
 
     app.run(host="0.0.0.0", port=port, debug=False)
